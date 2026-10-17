@@ -555,12 +555,13 @@ def gguf_clip_loader(path):
                 vsd = {f"model.{k}": v for k, v in vsd.items()}
             sd.update(vsd)
     elif arch == "qwen35":
-        # Dequantize the two vocab-sized tensors up front. Left as GGMLTensor they are
-        # re-dequantized on every forward, which both churns GBs per token and starves VRAM.
-        for key in ("token_embd.weight", "output.weight"):
-            if key in sd and sd[key].shape[0] >= (64 * 1024):
-                logging.warning(f"Dequantizing {key} to prevent runtime OOM.")
-                sd[key] = dequantize_tensor(sd[key], dtype=torch.float16)
+        # Only the embedding needs eager dequantization: it is a row gather, which cannot read a
+        # GGMLTensor. lm_head is a Linear that only the autoregressive generate() path calls, so
+        # leaving it quantized keeps it correct while costing its Q6_K size instead of fp16.
+        temb_key = "token_embd.weight"
+        if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
+            logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
+            sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         meta = extra.get("metadata", {})
         sd = qwen35_sd_remap(
             sd,
