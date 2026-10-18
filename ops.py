@@ -6,7 +6,9 @@ import logging
 import comfy.ops
 import comfy.lora
 import comfy.model_management
-from .dequant import dequantize_tensor, is_quantized
+from .dequant import dequantize_tensor, dequantize, dequantize_functions, is_quantized
+
+_ROW_GATHER_LOGGED = False
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -253,10 +255,46 @@ class GGMLOps(comfy.ops.manual_cast):
             output_dtype = out_dtype
             if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
                 out_dtype = None
+            # A quantised vocabulary table is dequantised whole by cast_bias_weight: 248320x4096
+            # fp16 is 2.0 GB, for a prompt that selects a few dozen rows. GGUF rows are whole
+            # blocks, so gather the selected rows as raw bytes and dequantise only those.
+            if (self.padding_idx is None and self.max_norm is None and not self.sparse
+                    and not self.scale_grad_by_freq):
+                rows = self._dequantize_rows(input, out_dtype)
+                if rows is not None:
+                    return rows.to(dtype=output_dtype)
             weight, _bias = self.cast_bias_weight(self, device=input.device, dtype=out_dtype)
             return torch.nn.functional.embedding(
                 input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
             ).to(dtype=output_dtype)
+
+        def _dequantize_rows(self, ids, dtype):
+            w = self.weight
+            qtype = getattr(w, "tensor_type", None)
+            if qtype not in dequantize_functions:
+                return None
+            block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+            hidden = int(getattr(w, "tensor_shape", w.shape)[-1])
+            if hidden % block_size:
+                return None
+            row_bytes = (hidden // block_size) * type_size
+            flat = w.to(ids.device).data.view(-1)
+            if flat.numel() % row_bytes:
+                return None
+            idx = ids.reshape(-1).to(torch.long)
+            if idx.numel() == 0:
+                return None
+            offsets = idx * row_bytes
+            cols = torch.arange(row_bytes, device=flat.device)
+            picked = flat[(offsets[:, None] + cols).reshape(-1)]
+            global _ROW_GATHER_LOGGED
+            if not _ROW_GATHER_LOGGED:
+                _ROW_GATHER_LOGGED = True
+                logging.info("GGUF embedding row-gather: %d ids x %d hidden (%s), table %d rows",
+                             idx.numel(), hidden, getattr(qtype, "name", qtype),
+                             flat.numel() // row_bytes)
+            out = dequantize(picked, qtype, (idx.numel(), hidden), dtype=dtype)
+            return out.reshape(*ids.shape, hidden)
 
     class LayerNorm(GGMLLayer, comfy.ops.manual_cast.LayerNorm):
         def forward_ggml_cast_weights(self, input):
