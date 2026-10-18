@@ -3,6 +3,7 @@ import torch
 import logging
 import inspect
 import collections
+import os
 
 import nodes
 import comfy.sd
@@ -32,8 +33,137 @@ def update_folder_names_and_paths(key, targets=[]):
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
+def _bake_quantized_weights(patcher, reserve_mib=None):
+    if reserve_mib is None:
+        reserve_mib = int(os.environ.get("GGUF_BAKE_RESERVE_MIB", "2048"))
+    """Dequantise the resident quantised weights once instead of once per forward.
+
+    `GGMLLayer.forward_ggml_cast_weights` calls `cast_bias_weight` -> `dequantize_tensor` on every
+    call, so a 4.75 G-parameter DiT re-dequantises its entire weight set on each step. On
+    MOSS-Image 512x512 that was measured at 27% of the end-to-end time. Baking swaps the
+    quantised weights for fp16 residents and turns `comfy_cast_weights` off: the per-step cost
+    goes away and the resident set grows by the fp16-minus-quantised difference (4.4 -> 9.1 GiB).
+
+    Layers are converted one at a time and the loop stops when the free memory reaches
+    `reserve_mib`, so a model that cannot hold the whole fp16 set gets a partial bake instead of
+    starving the device. The reserve is not a proof of safety: intermediates are allocated after
+    this point, which is why the caller also gates on token count.
+
+    Only weights already on the load device are baked, so offloaded layers keep the old behaviour.
+    """
+    model = patcher.model
+    device = patcher.load_device
+    targets = []
+    for m in model.modules():
+        weight = getattr(m, "weight", None)
+        if weight is None or not hasattr(m, "is_ggml_quantized") or not m.is_ggml_quantized():
+            continue
+        if weight.device != device:
+            continue
+        targets.append(m)
+    if not targets:
+        return True
+
+    # partially_load() hands weights over through async copies; replacing a tensor underneath a
+    # copy still in flight is how a page fault gets raised. Drain first.
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        pass
+
+    # The text encoder is still resident at the first DiT forward and eats the budget the bake
+    # needs (measured: free 5690 MB, both patchers loaded). Its conditioning is already computed,
+    # so evict it and keep only the DiT.
+    try:
+        keep = [lm for lm in comfy.model_management.current_loaded_models if lm.model is patcher]
+        want = comfy.model_management.get_free_memory(device) + 2560 * 2**20
+        comfy.model_management.free_memory(want, device, keep_loaded=keep)
+    except Exception as e:
+        logging.warning("GGUF bake could not evict the text encoder: %s", e)
+    try:
+        loaded = [type(lm.model).__name__ for lm in comfy.model_management.current_loaded_models]
+    except Exception:
+        loaded = []
+    logging.info("GGUF bake start: free=%.0f MB of %d MB reserve, loaded=%s",
+                 comfy.model_management.get_free_memory(device) / 2**20, reserve_mib, loaded)
+    # Measured after the eviction: the encoder's release must not be counted as bake growth.
+    before = torch.cuda.memory_allocated(device)
+    baked = 0
+    for m in targets:
+        if comfy.model_management.get_free_memory(device) < reserve_mib * 2**20:
+            logging.warning("GGUF bake stopped at %d/%d layers: under %d MB free",
+                            baked, len(targets), reserve_mib)
+            break
+        m.weight = torch.nn.Parameter(m.get_weight(m.weight.to(device), torch.float16), requires_grad=False)
+        m.comfy_cast_weights = False
+        if getattr(m, "bias", None) is not None:
+            m.bias = torch.nn.Parameter(m.bias.to(device=device, dtype=torch.float16), requires_grad=False)
+        baked += 1
+    grown = torch.cuda.memory_allocated(device) - before
+    model.model_loaded_weight_memory = getattr(model, "model_loaded_weight_memory", 0) + grown
+    # Replacing 252 quantised tensors leaves the freed segments scattered through the pool; the
+    # display driver then cannot find a contiguous block for a scanout pin even with ~2 GB free
+    # (measured 2026-10-18). Return the empty segments to the driver before sampling starts.
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    logging.info("GGUF bake: %d/%d layers resident as fp16, +%.0f MB", baked, len(targets), grown / 2**20)
+    return baked > 0
+
+
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
+    # Opt-in, set by UnetLoaderGGUF when dequant_dtype is "bake". See _arm_bake.
+    bake_quantized_weights = False
+    # Cap on the latent's H*W. The gate is about the sampling intermediates, not the sequence
+    # length: 1920x1440 (120*90 = 10800) lost the desktop's framebuffer to a full bake.
+    bake_max_latent_pixels = 4096
+
+    def load(self, *args, **kwargs):
+        out = super().load(*args, **kwargs)
+        self._arm_bake()
+        return out
+
+    def partially_load(self, *args, **kwargs):
+        # model_load() reaches the weights through partially_load, not load(); hooking only load()
+        # silently did nothing. Baking itself waits for the first apply_model, where the text
+        # encoder is already evicted and the sequence length is known.
+        out = super().partially_load(*args, **kwargs)
+        self._arm_bake()
+        return out
+
+    def _arm_bake(self):
+        if not self.bake_quantized_weights or getattr(self, "_bake_armed", False):
+            return
+        model = getattr(self, "model", None)
+        if model is None or not hasattr(model, "apply_model"):
+            return
+        self._bake_armed = True
+        orig = model.apply_model
+
+        def once(x, *a, **kw):
+            model.apply_model = orig
+            latent_pixels = 0
+            try:
+                if hasattr(x, "shape") and x.dim() >= 2:
+                    latent_pixels = int(x.shape[-2]) * int(x.shape[-1])
+            except Exception:
+                pass
+            if latent_pixels <= self.bake_max_latent_pixels:
+                # A bake failure must leave the unbaked path intact: the first step is already
+                # running and there is nothing to fall back to once the exception escapes.
+                try:
+                    _bake_quantized_weights(self)
+                except Exception as e:
+                    logging.warning("GGUF bake failed, keeping quantised weights: %s: %s",
+                                    type(e).__name__, e)
+            else:
+                logging.info("GGUF bake skipped: latent %d px over the %d limit",
+                             latent_pixels, self.bake_max_latent_pixels)
+            return orig(x, *a, **kw)
+
+        model.apply_model = once
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -150,7 +280,12 @@ class UnetLoaderGGUF:
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         ops = GGMLOps()
 
-        if dequant_dtype in ("default", None):
+        # "bake" is not a dtype: it asks for the weights to be dequantised once and kept resident,
+        # which the patcher does on the first apply_model (see _arm_bake).
+        bake = dequant_dtype == "bake"
+        if bake:
+            ops.Linear.dequant_dtype = None
+        elif dequant_dtype in ("default", None):
             ops.Linear.dequant_dtype = None
         elif dequant_dtype in ["target"]:
             ops.Linear.dequant_dtype = dequant_dtype
@@ -181,6 +316,8 @@ class UnetLoaderGGUF:
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
         model = GGUFModelPatcher.clone(model)
         model.patch_on_device = patch_on_device
+        if bake:
+            model.bake_quantized_weights = True
         return (model,)
 
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
@@ -190,7 +327,7 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
         return {
             "required": {
                 "unet_name": (unet_names,),
-                "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
+                "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16", "bake"], {"default": "default"}),
                 "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_on_device": ("BOOLEAN", {"default": False}),
             }
