@@ -3,6 +3,8 @@ import gguf
 import torch
 from tqdm import tqdm
 
+from .dequant_triton import triton_dequantize_q5k
+
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
 
@@ -40,6 +42,10 @@ def dequantize(data, qtype, oshape, dtype=None):
 
     n_blocks = rows.numel() // type_size
     blocks = rows.reshape((n_blocks, type_size))
+    if qtype == gguf.GGMLQuantizationType.Q5_K:
+        fast = triton_dequantize_q5k(blocks, dtype)
+        if fast is not None:
+            return fast.reshape(oshape)
     blocks = dequantize_blocks(blocks, block_size, type_size, dtype)
     return blocks.reshape(oshape)
 
